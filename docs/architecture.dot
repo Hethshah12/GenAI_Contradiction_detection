@@ -1,0 +1,255 @@
+digraph ContradictAI {
+    // ==================== GLOBAL ====================
+    rankdir=TB;
+    bgcolor="#0E1117";
+    fontname="Helvetica-Bold";
+    fontcolor="#FFFFFF";
+    labelloc="t";
+    labeljust="c";
+    label=<<FONT POINT-SIZE="28"><B>ContradictAI &#8212; End-to-End Pipeline Architecture</B></FONT><BR/><FONT POINT-SIZE="14" COLOR="#B0B8C4">Hybrid Retrieval &#8226; NLI Pre-filter &#8226; LLM Verification &#8226; Visual-Textual Multi-Hop &#8226; Knowledge Graph</FONT><BR/><BR/>>;
+    compound=true;
+    nodesep=0.45;
+    ranksep=0.9;
+    splines=true;
+    pad=0.8;
+    newrank=true;
+    ratio=0.85;
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fontname="Helvetica",
+        fontsize=12,
+        fontcolor="#FFFFFF",
+        penwidth=1.8,
+        margin="0.22,0.14",
+        height=0.6
+    ];
+    edge [
+        fontname="Helvetica",
+        fontsize=10,
+        fontcolor="#CBD5E1",
+        color="#64748B",
+        penwidth=1.4,
+        arrowsize=0.9
+    ];
+
+    // ==================== STAGE 1: INPUT ====================
+    subgraph cluster_1_input {
+        label=<<B><FONT POINT-SIZE="14" COLOR="#7EE8FA">STAGE 1  &#8226;  INPUT LAYER</FONT></B>>;
+        style="rounded,filled";
+        color="#7EE8FA";
+        fillcolor="#0B1F2A";
+        penwidth=2;
+        margin=16;
+
+        UI      [label="Streamlit UI\napp.py  (1511 lines)\n24 session keys", fillcolor="#0D3B66", color="#7EE8FA"];
+        PDF     [label="PDF Upload\n(PyMuPDF / fitz)", fillcolor="#0D3B66", color="#7EE8FA"];
+        Params  [label="Sidebar Controls\nauto-calibration  |  manual\n\u03B1, top-k, thresholds", fillcolor="#0D3B66", color="#7EE8FA"];
+    }
+
+    // ==================== STAGE 2: DOCUMENT PROCESSING ====================
+    subgraph cluster_2_doc {
+        label=<<B><FONT POINT-SIZE="14" COLOR="#43E97B">STAGE 2  &#8226;  DOCUMENT PROCESSING</FONT></B>>;
+        style="rounded,filled";
+        color="#43E97B";
+        fillcolor="#0C2418";
+        penwidth=2;
+        margin=16;
+
+        Extract  [label="Text Extraction\ndocument_processor.py\nsoft-wrap rejoin", fillcolor="#134E2A", color="#43E97B"];
+        Chunk    [label="Semantic Chunking\nheading-based  (primary)\nparagraph + 200-char overlap\n(fallback)", fillcolor="#134E2A", color="#43E97B"];
+        ImgExtr  [label="Image / Chart Extraction\nxref-recurrence de-dup\n200 DPI render", fillcolor="#134E2A", color="#43E97B"];
+    }
+
+    // ==================== STAGE 3: EMBEDDING & STORAGE ====================
+    subgraph cluster_3_emb {
+        label=<<B><FONT POINT-SIZE="14" COLOR="#F9D423">STAGE 3  &#8226;  EMBEDDING &amp; PERSISTENCE</FONT></B>>;
+        style="rounded,filled";
+        color="#F9D423";
+        fillcolor="#2A2208";
+        penwidth=2;
+        margin=16;
+
+        MiniLM   [label="all-MiniLM-L6-v2\n384-dim dense vectors\n(Sentence-Transformers)", fillcolor="#4A3B0C", color="#F9D423"];
+        BM25     [label="BM25 Sparse Index\nstopword-filtered tokens", fillcolor="#4A3B0C", color="#F9D423"];
+        FAISS    [label="FAISS IndexFlatL2\n(in-memory dense)", fillcolor="#4A3B0C", color="#F9D423"];
+        Chroma   [label="ChromaDB  (persistent)\nCHUNK_VERSION = &quot;8&quot;\ncache invalidation", fillcolor="#4A3B0C", color="#F9D423"];
+    }
+
+    // ==================== STAGE 4: HYBRID RETRIEVAL ====================
+    subgraph cluster_4_ret {
+        label=<<B><FONT POINT-SIZE="14" COLOR="#FF9A9E">STAGE 4  &#8226;  HYBRID RETRIEVAL</FONT></B>>;
+        style="rounded,filled";
+        color="#FF9A9E";
+        fillcolor="#2E1414";
+        penwidth=2;
+        margin=16;
+
+        Hybrid   [label=<<B>HybridRetriever</B><BR/>score = &#945; &#183; dense + (1 &#8722; &#945;) &#183; BM25<BR/>top-k neighbours  (k=3&#8211;8)>, fillcolor="#5C1F1F", color="#FF9A9E"];
+    }
+
+    // ==================== STAGE 5: NLI PRE-FILTER ====================
+    subgraph cluster_5_nli {
+        label=<<B><FONT POINT-SIZE="14" COLOR="#C084FC">STAGE 5  &#8226;  NLI PRE-FILTER  (novelty)</FONT></B>>;
+        style="rounded,filled";
+        color="#C084FC";
+        fillcolor="#251635";
+        penwidth=2;
+        margin=16;
+
+        Topical  [label="Topical Overlap Gate\nkeyword overlap &#8805; 1  (intra)\n&#8805; 2  (cross)\n+ meta-sentence filter", fillcolor="#3D2659", color="#C084FC"];
+        DeBERTa  [label="DeBERTa-v3-base NLI\ncross-encoder\n[contradiction, entail, neutral]", fillcolor="#3D2659", color="#C084FC"];
+        Combined [label=<<B>Combined Score</B><BR/>P<SUB>contra</SUB> &#215; (1 &#8722; P<SUB>neutral</SUB>)>, fillcolor="#3D2659", color="#C084FC"];
+        Thresh   [label="Thresholds\nintra = 0.40\ncross = 0.55", fillcolor="#3D2659", color="#C084FC"];
+    }
+
+    // ==================== STAGE 6: LLM VERIFICATION ====================
+    subgraph cluster_6_llm {
+        label=<<B><FONT POINT-SIZE="14" COLOR="#F97316">STAGE 6  &#8226;  LLM VERIFICATION</FONT></B>>;
+        style="rounded,filled";
+        color="#F97316";
+        fillcolor="#331B08";
+        penwidth=2;
+        margin=16;
+
+        Groq      [label="LLaMA 3.3 70B  (Groq)\n2s rate-limit backoff\ncontradiction_checker.py", fillcolor="#5C2F10", color="#F97316"];
+        SelfCons  [label="Self-Consistency Voting\nT = {0.0, 0.3, 0.5}\nmajority vote", fillcolor="#5C2F10", color="#F97316"];
+        Classify  [label="Type Classification\nDirect / Conditional /\nTemporal / Scope / Quantitative", fillcolor="#5C2F10", color="#F97316"];
+    }
+
+    // ==================== STAGE 7: VISION PIPELINE ====================
+    subgraph cluster_7_vis {
+        label=<<B><FONT POINT-SIZE="14" COLOR="#22D3EE">STAGE 7  &#8226;  VISION PIPELINE  (novelty: visual-textual)</FONT></B>>;
+        style="rounded,filled";
+        color="#22D3EE";
+        fillcolor="#0B2A2E";
+        penwidth=2;
+        margin=16;
+
+        ChartExt [label="Chart Analyzer\nLLaMA 4 Scout 17B\nLLaMA 3.2 90B / 11B Vision\n2-phase extraction", fillcolor="#124249", color="#22D3EE"];
+        ChartData[label="ChartData dataclass\nto_text_chunk()\nIDs start at 10001", fillcolor="#124249", color="#22D3EE"];
+        VisCheck [label="Visual Contradiction Checker\n6 types: Numerical / Trend /\nScope / Categorical /\nTemporal / Omission", fillcolor="#124249", color="#22D3EE"];
+        MultiHop [label=<<B>Multi-Hop Reasoning</B><BR/>chart + primary text + secondary texts>, fillcolor="#124249", color="#22D3EE"];
+    }
+
+    // ==================== STAGE 8: KNOWLEDGE GRAPH ====================
+    subgraph cluster_8_kg {
+        label=<<B><FONT POINT-SIZE="14" COLOR="#A7F3D0">STAGE 8  &#8226;  KNOWLEDGE GRAPH  (Neo4j)</FONT></B>>;
+        style="rounded,filled";
+        color="#A7F3D0";
+        fillcolor="#0B2A1D";
+        penwidth=2;
+        margin=16;
+
+        Entities [label="Entity Extraction\n26 regex patterns\n(security / policy / data /\ncomms / people)", fillcolor="#124A31", color="#A7F3D0"];
+        Neo4j    [label="Neo4j Knowledge Graph\nDocument / Section /\nStatement / Entity nodes\nCONTAINS / MENTIONS /\nCONTRADICTS edges", fillcolor="#124A31", color="#A7F3D0"];
+        Cypher   [label="Cypher Queries\ntransitive + circular\ncontradictions", fillcolor="#124A31", color="#A7F3D0"];
+        GraphAnl [label="Hotspot Sections\nPropagation Score", fillcolor="#124A31", color="#A7F3D0"];
+    }
+
+    // ==================== STAGE 9: OUTPUT ====================
+    subgraph cluster_9_out {
+        label=<<B><FONT POINT-SIZE="14" COLOR="#F472B6">STAGE 9  &#8226;  OUTPUT &amp; UI</FONT></B>>;
+        style="rounded,filled";
+        color="#F472B6";
+        fillcolor="#2E1224";
+        penwidth=2;
+        margin=16;
+
+        Viz      [label="Visualiser\n9 Plotly / NetworkX charts", fillcolor="#5C1F40", color="#F472B6"];
+        Report   [label="PDF Report\nfpdf2 + unicode clean()", fillcolor="#5C1F40", color="#F472B6"];
+        QA       [label="Q&amp;A Chat\nqa_chat.py\nT=0, source-grounded,\n4 anti-hallucination guards", fillcolor="#5C1F40", color="#F472B6"];
+        Tabs     [label="Streamlit Tabs\nContradictions | Q&amp;A | Graph", fillcolor="#5C1F40", color="#F472B6"];
+    }
+
+    // ==================== EDGES ====================
+
+    // Stage 1 -> 2
+    UI      -> PDF     [label="upload"];
+    Params  -> UI      [style=dashed, dir=none, label="tune"];
+    PDF     -> Extract [label="raw pages", lhead=cluster_2_doc];
+
+    // Stage 2 internal
+    Extract -> Chunk    [label="text"];
+    Extract -> ImgExtr  [label="images"];
+
+    // Stage 2 -> 3
+    Chunk  -> MiniLM   [label="chunks"];
+    Chunk  -> BM25     [label="tokens"];
+    MiniLM -> FAISS    [label="dense"];
+    MiniLM -> Chroma   [label="persist"];
+
+    // Stage 3 -> 4
+    FAISS -> Hybrid    [label="dense scores"];
+    BM25  -> Hybrid    [label="sparse scores"];
+
+    // Stage 4 -> 5
+    Hybrid -> Topical    [label="candidate pairs"];
+    Chunk  -> Topical    [label="statements\n(split + meta-filter)", constraint=false];
+
+    // Stage 5 internal
+    Topical  -> DeBERTa   [label="gated pairs"];
+    DeBERTa  -> Combined  [label="softmax probs"];
+    Combined -> Thresh;
+
+    // Stage 5 -> 6
+    Thresh -> Groq     [label="positives only"];
+
+    // Stage 6 internal
+    Groq     -> SelfCons;
+    SelfCons -> Classify;
+
+    // Stage 2 -> 7  (images path)
+    ImgExtr -> ChartExt;
+    ChartExt -> ChartData;
+    ChartData -> VisCheck;
+    Chunk     -> VisCheck [label="text chunks", constraint=false];
+    VisCheck  -> MultiHop;
+
+    // Stage 7 -> 6
+    MultiHop -> Classify  [label="merge verdicts", constraint=false];
+
+    // Stage 3 dotted link (ChartData embedded too)
+    ChartData -> MiniLM [style=dotted, label="chart text\nembedded", constraint=false];
+
+    // Stage 6 -> 8
+    Classify -> Entities  [label="verified pairs"];
+    Entities -> Neo4j;
+    Classify -> Neo4j     [label="CONTRADICTS edges", constraint=false];
+    Neo4j    -> Cypher;
+    Cypher   -> GraphAnl;
+
+    // Stage 6 -> 9
+    Classify -> Viz      [label="results"];
+    GraphAnl -> Viz      [label="graph metrics", constraint=false];
+
+    // Stage 9 internal
+    Viz      -> Tabs;
+    Viz      -> Report   [label="export"];
+    Report   -> Tabs     [label="download"];
+
+    // Q&A path
+    Chroma -> QA   [label="retrieval\ncontext", constraint=false];
+    Groq   -> QA   [label="T=0\ngrounded", constraint=false];
+    QA     -> Tabs;
+
+    // Force ordering between stages via invisible edges
+    PDF      -> Extract [style=invis];
+    Chunk    -> MiniLM  [style=invis];
+    MiniLM   -> Hybrid  [style=invis];
+    Hybrid   -> Topical [style=invis];
+    Thresh   -> Groq    [style=invis];
+    Classify -> Neo4j   [style=invis];
+    Neo4j    -> Viz     [style=invis];
+
+    // Horizontal alignment within each stage
+    { rank=same; UI; PDF; Params; }
+    { rank=same; Extract; Chunk; ImgExtr; }
+    { rank=same; MiniLM; BM25; FAISS; Chroma; }
+    { rank=same; Topical; DeBERTa; Combined; Thresh; }
+    { rank=same; Groq; SelfCons; Classify; }
+    { rank=same; ChartExt; ChartData; VisCheck; MultiHop; }
+    { rank=same; Entities; Neo4j; Cypher; GraphAnl; }
+    { rank=same; Viz; Report; QA; Tabs; }
+}

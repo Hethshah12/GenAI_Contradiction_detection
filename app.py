@@ -12,7 +12,10 @@ import streamlit as st
 from pipeline.document_processor import extract_text_from_pdf, semantic_chunk, label_chunks
 from pipeline.embedder import embed_chunks, build_faiss_index
 from pipeline.hybrid_retriever import HybridRetriever
-from pipeline.contradiction_checker import run_full_pipeline, auto_detect_params
+from pipeline.contradiction_checker import (
+    run_full_pipeline, auto_detect_params, verify_contradictions_with_llm,
+)
+from pipeline.numeric_extractor import find_numeric_contradictions
 from pipeline.chroma_store import store_chunks, load_chunks, list_stored_documents, delete_document
 from pipeline.qa_chat import answer_question
 from pipeline.visualiser import (
@@ -30,7 +33,10 @@ from pipeline.graph_store import (
     get_transitive_contradictions,
     get_entity_contradiction_clusters,
     get_most_contradictory_sections,
+    get_graph,
+    NEO4J_AVAILABLE,
 )
+from graph_tab_integration import render_graph_tab
 
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -682,7 +688,11 @@ st.markdown("<hr class='divider'>", unsafe_allow_html=True)
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN TABS
 # ─────────────────────────────────────────────────────────────────────────────
-tab_detect, tab_chat = st.tabs(["⚡  Contradiction Detection", "💬  Document Q&A"])
+tab_detect, tab_chat, tab_graph = st.tabs([
+    "⚡  Contradiction Detection",
+    "💬  Document Q&A",
+    "🕸️  Graph Intelligence",
+])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — DETECTION
@@ -906,6 +916,47 @@ with tab_detect:
                 phase_label.empty()
                 status.empty()
                 timer_display.empty()
+
+                # ── NUMERIC CONTRADICTION PASS (deterministic, ~100ms) ──
+                # Regex-based (entity, metric, value) extraction. Adds to
+                # the contradiction list but never removes anything. Fail-
+                # open: any exception is swallowed inside the helper.
+                try:
+                    numeric_c = find_numeric_contradictions(chunks) or []
+                    if numeric_c:
+                        # Dedup against existing NLI results by (target, first related)
+                        existing_keys = {
+                            (x.get("target", ""),
+                             (x.get("related_sections") or [""])[0]
+                                 .replace(" (same section)", ""))
+                            for x in c
+                        }
+                        for nc in numeric_c:
+                            key = (nc.get("target", ""),
+                                   (nc.get("related_sections") or [""])[0])
+                            if key in existing_keys:
+                                continue
+                            c.append(nc)
+                except Exception as _e:
+                    logger.warning(f"numeric extractor skipped: {_e}")
+
+                # ── LLM VERIFIER (parallel, fail-open) ──────────────────
+                # Second-pass check on uncertain NLI pairs (conf 60-85).
+                # NUMERIC pairs and conf>=86 pairs are already trusted and
+                # bypass this step. Runs 4-wide in parallel so the wall-
+                # clock cost on a typical doc is ~1-2s.
+                try:
+                    phase_label.markdown(
+                        "<div style='font-size:0.78rem;color:#ffb347;font-weight:600;"
+                        "font-family:JetBrains Mono,monospace;'>"
+                        "🔍 LLM Verification (parallel)</div>",
+                        unsafe_allow_html=True
+                    )
+                    c = verify_contradictions_with_llm(c, parallel=4)
+                except Exception as _e:
+                    logger.warning(f"LLM verifier skipped: {_e}")
+                finally:
+                    phase_label.empty()
 
                 st.session_state.contradictions = c
                 st.session_state.clean_count    = cl
@@ -1510,3 +1561,10 @@ with tab_chat:
                 st.session_state.retriever  = HybridRetriever(chunks, emb, idx)
                 st.session_state.doc_name   = qa_upload.name
             st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — GRAPH INTELLIGENCE
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_graph:
+    render_graph_tab()

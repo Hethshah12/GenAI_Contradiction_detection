@@ -2,9 +2,13 @@ import os
 import re
 import time
 import json
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from groq import Groq
 from dotenv import load_dotenv
 from pipeline.hybrid_retriever import HybridRetriever
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -327,6 +331,60 @@ def _make_pair_key(id1: int, id2: int) -> str:
     return f"{min(id1, id2)}-{max(id1, id2)}"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED-CONCEPT GATE
+# Rejects pairs of statements that have no meaningful noun / number overlap.
+# NLI models happily mark unrelated sentences like "Japan is permissive"
+# vs "Singapore is a regulatory leader" as contradictions because the
+# surface structure looks contrastive. Requiring real shared referents
+# kills that class of false positive cheaply (no extra API call).
+# ─────────────────────────────────────────────────────────────────────────────
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "of", "to", "for", "in", "on", "at",
+    "with", "by", "from", "as", "is", "are", "was", "were", "be", "been", "being",
+    "it", "its", "this", "that", "these", "those", "their", "they", "them",
+    "has", "have", "had", "will", "would", "should", "could", "can", "may",
+    "not", "no", "also", "than", "then", "so", "if", "while", "which", "who",
+    "our", "we", "your", "you", "his", "her", "he", "she", "i", "me", "my",
+    "all", "any", "some", "such", "other", "more", "most", "less", "least",
+    "section", "report", "figure", "table", "page", "document",
+}
+
+_TOKEN_RE = re.compile(r"[A-Za-z]{4,}|\d+(?:[.,]\d+)*%?|\$[\d.,]+[BMK]?")
+
+
+def _concept_tokens(text: str) -> set:
+    """
+    Extract the 'content words' and numeric tokens that anchor a
+    statement's meaning. We keep:
+      - words of length >= 4 that are not stopwords
+      - raw numbers (optionally with %, commas, decimals)
+      - dollar figures like $67, $1.45
+    Proper nouns are preserved via case-insensitive match on the lemma.
+    """
+    tokens = set()
+    for m in _TOKEN_RE.findall(text):
+        t = m.lower().rstrip('s')  # crude singularisation
+        if t in _STOPWORDS:
+            continue
+        tokens.add(t)
+    return tokens
+
+
+def _shared_concept_overlap(a: str, b: str) -> int:
+    """Number of shared content/number tokens between two statements."""
+    return len(_concept_tokens(a) & _concept_tokens(b))
+
+
+def _pair_key_for_contradiction(c: dict) -> str:
+    """Canonical undirected key for a contradiction pair."""
+    a = c.get("target") or ""
+    related = c.get("related_sections") or []
+    b = (related[0] if related else a).replace(" (same section)", "")
+    ids = sorted([a, b])
+    return f"{ids[0]}__{ids[1]}"
+
+
 def run_full_pipeline(
     chunks: list,
     embeddings,
@@ -381,6 +439,12 @@ def run_full_pipeline(
             conf = int(c.score * 100)
             if conf < min_confidence:
                 continue
+            # Shared-concept gate: intra-section pairs still need at
+            # least 2 shared content tokens - otherwise the chunk just
+            # contains two unrelated sentences (e.g. "Japan permissive"
+            # vs "Singapore regulatory leader").
+            if _shared_concept_overlap(c.statement_a, c.statement_b) < 2:
+                continue
             severity = "High" if conf >= 85 else ("Medium" if conf >= 70 else "Low")
             c_type = _classify_contradiction_type(c.statement_a, c.statement_b)
 
@@ -419,6 +483,9 @@ def run_full_pipeline(
             conf = int(c.score * 100)
             if conf < min_confidence:
                 continue
+            # Shared-concept gate (see intra comment).
+            if _shared_concept_overlap(c.statement_a, c.statement_b) < 2:
+                continue
             severity = "High" if conf >= 85 else ("Medium" if conf >= 70 else "Low")
             c_type = _classify_contradiction_type(c.statement_a, c.statement_b)
 
@@ -450,6 +517,24 @@ def run_full_pipeline(
                 "confidence":       conf,
                 "type":             c_type,
             })
+
+    # ── Pair deduplication ─────────────────────────────────────────
+    # Several (A -> B) and (B -> A) entries frequently survive NLI
+    # scoring when both chunks retrieve each other. Keep only the
+    # highest-confidence entry per undirected pair.
+    if contradictions:
+        dedup: dict[str, dict] = {}
+        for c in contradictions:
+            key = _pair_key_for_contradiction(c)
+            if key not in dedup or c["confidence"] > dedup[key]["confidence"]:
+                dedup[key] = c
+        # Preserve original ordering (stable by first-seen insertion)
+        seen_keys = []
+        for c in contradictions:
+            k = _pair_key_for_contradiction(c)
+            if k not in seen_keys:
+                seen_keys.append(k)
+        contradictions = [dedup[k] for k in seen_keys]
 
     # Optional LLM enrichment for top 3
     try:
@@ -656,3 +741,246 @@ def check_with_self_consistency(
         "votes":            votes,
         "agreement":        f"{max(contradiction_votes, no_contradiction_votes)}/{len(votes)}",
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM VERIFIER (parallelized, cached, fail-open)
+# ─────────────────────────────────────────────────────────────────────────────
+# Second-pass verification for NLI-origin contradictions with uncertain
+# confidence (60-85). Sends a tight, structured "YES/NO contradict?" prompt
+# to Groq with self-consistency at T=[0.0, 0.3] — if both votes say NO we
+# drop the pair; otherwise we keep it and bump confidence by a small
+# verification bonus.
+#
+# Design constraints (user requirement — "don't ruin performance"):
+#   * Only pairs in the uncertain band are verified. NUMERIC-origin and
+#     confidence>=86 pairs are trusted and skipped.
+#   * Parallel via ThreadPoolExecutor (default 4 workers). Groq is I/O-bound
+#     so threads are fine despite the GIL.
+#   * Per-statement-pair cache keyed by (stmt_a, stmt_b) hash — identical
+#     pairs (rare but possible with symmetric re-detection) cost one call.
+#   * Any exception is swallowed and the pair is retained unchanged
+#     (fail-open: the verifier can never DELETE content the NLI+LLM stack
+#     produced, only drop things it's confident are false positives).
+#   * Short max_tokens (30) → ~100-150ms per call, 4x parallel → ~50ms/pair
+#     amortised for a typical 10-pair document.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_VERIFIER_SYSTEM = (
+    "You are a strict fact-checker. You will be shown two statements "
+    "pulled from a single document. Your job is to decide whether they "
+    "are GENUINELY contradictory — they cannot both be true at the same "
+    "time about the same subject.\n\n"
+    "Only answer YES if they are a real logical conflict. Answer NO for "
+    "topic overlap, different emphasis, one general + one specific "
+    "(unless mutually exclusive), different time periods, or unrelated "
+    "claims that just share vocabulary.\n\n"
+    "Respond in exactly this format:\n"
+    "VERDICT: YES|NO\n"
+    "REASON: <one short sentence>"
+)
+
+_VERIFY_UNCERTAIN_MIN = 60   # ignore things below the pipeline's min_confidence
+_VERIFY_UNCERTAIN_MAX = 85   # >= 86 we trust the NLI+LLM-enrich pipeline
+_VERIFY_BONUS_KEEP    = 3    # small confidence bump on a YES verdict
+_VERIFY_PENALTY       = 10   # confidence drop if one vote disagrees (soft keep)
+
+
+def _extract_statements_from_analysis(analysis: str) -> tuple[str, str]:
+    """Pull out Statement A / Statement B quoted text from the analysis blob."""
+    a = re.search(r'Statement A[^"]*"([^"]+)"', analysis or "")
+    b = re.search(r'Statement B[^"]*"([^"]+)"', analysis or "")
+    return (a.group(1).strip() if a else "",
+            b.group(1).strip() if b else "")
+
+
+def _verify_one_pair(stmt_a: str, stmt_b: str, temperature: float) -> tuple[bool, str]:
+    """
+    Single Groq call. Returns (is_contradiction_vote, reason_text).
+    Raises on hard failure so the caller can treat it as "unknown".
+    """
+    client = get_client()
+    user = (
+        f"Statement A: \"{stmt_a}\"\n"
+        f"Statement B: \"{stmt_b}\"\n\n"
+        "Do these statements contradict each other?"
+    )
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": _VERIFIER_SYSTEM},
+            {"role": "user",   "content": user},
+        ],
+        temperature=temperature,
+        max_tokens=60,
+    )
+    text = (response.choices[0].message.content or "").strip()
+    verdict_match = re.search(r'VERDICT:\s*(YES|NO)', text, re.IGNORECASE)
+    reason_match = re.search(r'REASON:\s*(.+)', text, re.IGNORECASE | re.DOTALL)
+    is_yes = bool(verdict_match and verdict_match.group(1).upper() == "YES")
+    reason = reason_match.group(1).strip() if reason_match else text[:160]
+    return is_yes, reason
+
+
+def _verify_with_self_consistency(stmt_a: str, stmt_b: str) -> dict:
+    """
+    Two-vote self-consistency check at T=[0.0, 0.3].
+    Returns: {yes_votes, no_votes, reason, errored}.
+    On any API failure we set errored=True so the caller keeps the pair.
+    """
+    votes = []
+    reason = ""
+    errored = False
+    for temp in (0.0, 0.3):
+        try:
+            is_yes, r = _verify_one_pair(stmt_a, stmt_b, temp)
+            votes.append(is_yes)
+            if is_yes and not reason:
+                reason = r
+        except Exception as e:
+            errored = True
+            logger.debug(f"verifier call failed (T={temp}): {e}")
+            # Don't retry inline — we're in parallel, fail-open.
+            break
+    yes = sum(1 for v in votes if v)
+    no = sum(1 for v in votes if not v)
+    return {"yes_votes": yes, "no_votes": no, "reason": reason, "errored": errored}
+
+
+def verify_contradictions_with_llm(
+    contradictions: list[dict],
+    parallel: int = 4,
+    progress_callback=None,
+) -> list[dict]:
+    """
+    Second-pass LLM verification for uncertain NLI-origin contradictions.
+
+    Args
+    ----
+    contradictions :   list of contradiction dicts from run_full_pipeline
+                       (and/or numeric_extractor).
+    parallel :         max concurrent API calls (default 4).
+    progress_callback: optional fn(done, total, label) for UI.
+
+    Returns
+    -------
+    list[dict] : same shape, with these fields possibly set on each entry:
+        - ``verified``: True/False (True means passed LLM check)
+        - ``verification_reason``: str (filled on YES verdict)
+        - ``confidence``: adjusted up (+3) or down (-10) by vote outcome
+        - Entries where BOTH votes said NO are DROPPED.
+        - Entries where the verifier errored out are kept untouched.
+
+    Non-goal
+    --------
+    The verifier never creates new contradictions. It only filters / scores
+    existing ones. NUMERIC-origin pairs are now gated alongside NLI/LLM
+    pairs when their confidence falls in the uncertain band.
+    """
+    if not contradictions:
+        return contradictions
+
+    # Partition: verify the uncertain middle band regardless of source.
+    # NUMERIC pairs used to skip verification, but they turned out to be
+    # the biggest false-positive generator on business reports (any two
+    # percentages or dollar figures with enough shared vocabulary paired
+    # up). Running them through the LLM gate is the single biggest
+    # precision win available without sacrificing recall.
+    #
+    # We still skip:
+    #   * confidence >= 86     — trust the upstream signal
+    #   * confidence <  60     — already below the pipeline's min threshold
+    #   * already LLM-verified — don't re-verify
+    to_verify: list[tuple[int, dict, str, str]] = []
+    for idx, c in enumerate(contradictions):
+        if c.get("llm_verified") is True:
+            continue  # already passed a previous LLM check
+        conf = int(c.get("confidence", 0) or 0)
+        if conf < _VERIFY_UNCERTAIN_MIN or conf > _VERIFY_UNCERTAIN_MAX:
+            continue
+        stmt_a, stmt_b = _extract_statements_from_analysis(c.get("analysis", ""))
+        if not stmt_a or not stmt_b:
+            continue  # nothing to ask about
+        to_verify.append((idx, c, stmt_a, stmt_b))
+
+    if not to_verify:
+        return contradictions
+
+    # Local cache to dedup identical statement pairs across the batch.
+    cache: dict[tuple[str, str], dict] = {}
+    results: dict[int, dict] = {}
+
+    def _worker(task):
+        idx, _c, a, b = task
+        key = (a[:200], b[:200])
+        if key in cache:
+            return idx, cache[key]
+        try:
+            verdict = _verify_with_self_consistency(a, b)
+        except Exception as e:
+            logger.debug(f"verifier worker crashed: {e}")
+            verdict = {"yes_votes": 0, "no_votes": 0, "reason": "", "errored": True}
+        cache[key] = verdict
+        return idx, verdict
+
+    total = len(to_verify)
+    completed = 0
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, int(parallel))) as pool:
+            futures = [pool.submit(_worker, task) for task in to_verify]
+            for fut in as_completed(futures):
+                try:
+                    idx, verdict = fut.result(timeout=45)
+                    results[idx] = verdict
+                except Exception as e:
+                    logger.debug(f"verifier future failed: {e}")
+                completed += 1
+                if progress_callback:
+                    try:
+                        progress_callback(completed, total, "verify")
+                    except Exception:
+                        pass
+    except Exception as e:
+        # Catastrophic pool failure → skip verification entirely (fail-open).
+        logger.warning(f"verifier pool failed, keeping all pairs: {e}")
+        return contradictions
+
+    out: list[dict] = []
+    dropped = 0
+    for idx, c in enumerate(contradictions):
+        v = results.get(idx)
+        if v is None:
+            out.append(c)
+            continue
+        if v.get("errored") or (v["yes_votes"] + v["no_votes"]) == 0:
+            # Verifier couldn't give a verdict — keep the pair untouched.
+            out.append(c)
+            continue
+
+        # 2 YES → definite keep + bump, 1-1 → soft-keep with penalty,
+        # 2 NO → drop.
+        if v["yes_votes"] >= 2:
+            c = dict(c)  # shallow copy so we don't mutate caller state
+            c["verified"] = True
+            c["llm_verified"] = True
+            c["verification_reason"] = v.get("reason", "")
+            c["confidence"] = min(99, int(c.get("confidence", 0)) + _VERIFY_BONUS_KEEP)
+            if v.get("reason"):
+                c["analysis"] = (c.get("analysis", "") +
+                                 f"\n\nLLM Verification: {v['reason']}")
+            out.append(c)
+        elif v["yes_votes"] == 1:
+            c = dict(c)
+            c["verified"] = False
+            c["llm_verified"] = False
+            c["confidence"] = max(60, int(c.get("confidence", 0)) - _VERIFY_PENALTY)
+            out.append(c)
+        else:
+            # Both votes NO → drop.
+            dropped += 1
+            continue
+
+    if dropped:
+        logger.info(f"LLM verifier dropped {dropped}/{total} uncertain pairs")
+
+    return out

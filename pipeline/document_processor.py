@@ -1,6 +1,7 @@
 import re
 import hashlib
 import logging
+from collections import Counter
 import fitz  # PyMuPDF
 
 logger = logging.getLogger(__name__)
@@ -13,15 +14,90 @@ HEADING_PATTERN = re.compile(
     re.MULTILINE
 )
 
+# Regexes that identify page-header / page-footer noise even when the
+# exact text varies from page to page (e.g. page numbers change).
+_HEADER_NOISE_PATTERNS = [
+    re.compile(r'^\s*Page\s+\d+\s*$', re.IGNORECASE),
+    re.compile(r'^\s*\d+\s*/\s*\d+\s*$'),                     # "3 / 14"
+    re.compile(r'^\s*[-–—]\s*\d+\s*[-–—]?\s*$'),               # "- 3 -"
+    re.compile(r'^\s*\d{1,3}\s*$'),                            # bare page number
+]
+
+
+def _normalise_line(line: str) -> str:
+    """Collapse whitespace and page numbers so repeated headers match each other."""
+    s = line.strip()
+    s = re.sub(r'\s+', ' ', s)
+    # Replace bare trailing/leading page numbers so "Report Page 3" and
+    # "Report Page 14" normalise to the same key.
+    s = re.sub(r'\bPage\s+\d+\b', 'Page N', s, flags=re.IGNORECASE)
+    s = re.sub(r'\b\d{1,3}\s*/\s*\d{1,3}\b', 'N/N', s)
+    return s
+
+
+def _detect_running_lines(page_texts: list, min_pages: int = 3, ratio: float = 0.30) -> set:
+    """
+    Return the set of normalised lines that appear on >= `ratio` of pages
+    (and at least `min_pages` pages). Those are the running headers/footers
+    that leak into every chunk.
+    """
+    if len(page_texts) < min_pages:
+        return set()
+
+    counter: Counter = Counter()
+    for page in page_texts:
+        # Only look at the top 3 and bottom 3 lines of each page - that's
+        # where running headers/footers live. This avoids killing real
+        # repeated content like bullet labels in the body.
+        lines = [ln for ln in page.splitlines() if ln.strip()]
+        candidates = lines[:3] + lines[-3:]
+        seen_on_this_page = set()
+        for ln in candidates:
+            key = _normalise_line(ln)
+            if len(key) < 3 or len(key) > 120:
+                continue
+            if key not in seen_on_this_page:
+                counter[key] += 1
+                seen_on_this_page.add(key)
+
+    threshold = max(min_pages, int(len(page_texts) * ratio))
+    return {k for k, v in counter.items() if v >= threshold}
+
+
+def _strip_running_lines(page_text: str, running: set) -> str:
+    """Remove lines from a page that match known running header/footer patterns."""
+    kept = []
+    for ln in page_text.splitlines():
+        stripped = ln.strip()
+        if not stripped:
+            kept.append(ln)
+            continue
+        key = _normalise_line(stripped)
+        if key in running:
+            continue
+        if any(p.match(stripped) for p in _HEADER_NOISE_PATTERNS):
+            continue
+        kept.append(ln)
+    return '\n'.join(kept)
+
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract raw text from PDF bytes."""
+    """
+    Extract text from a PDF and remove page-level noise (running
+    headers/footers, bare page numbers) so downstream chunking doesn't
+    glue them onto body content.
+    """
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    pages_text = []
-    for page in doc:
-        pages_text.append(page.get_text())
+    pages_text = [page.get_text() for page in doc]
     doc.close()
-    return "\n\n".join(pages_text)
+
+    running = _detect_running_lines(pages_text)
+    if running:
+        logger.info(f"Stripping {len(running)} running header/footer line(s): "
+                    + "; ".join(list(running)[:3]))
+
+    cleaned = [_strip_running_lines(p, running) for p in pages_text]
+    return "\n\n".join(cleaned)
 
 
 def extract_page_images(file_bytes: bytes, min_size: int = 150) -> list[dict]:
@@ -225,25 +301,66 @@ def semantic_chunk(text: str, min_len: int = 150, max_len: int = 1000,
     return overlapped
 
 
-def label_chunks(chunks: list) -> list:
+_TOC_INDICATORS = re.compile(
+    r'(?:table of contents|^\s*\d+\.\s+[A-Z][^\n]{3,60}\s*\.{3,}\s*\d+\s*$)',
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _is_low_info(text: str) -> bool:
+    """
+    Decide whether a chunk has enough propositional content to analyse.
+    Cover pages, tables of contents and running-header remnants have
+    almost no truth-apt sentences and produce spurious contradictions.
+    """
+    if not text:
+        return True
+    stripped = text.strip()
+    if len(stripped) < 200:
+        return True
+
+    # Count how many sentence-like constructs the chunk actually has.
+    sentences = re.findall(r'[A-Z][^.!?]{15,}[.!?]', stripped)
+    if len(sentences) < 2:
+        return True
+
+    # Table-of-contents chunks have lots of "Title ....... 5" rows
+    toc_hits = len(_TOC_INDICATORS.findall(stripped))
+    if toc_hits >= 3:
+        return True
+
+    # Cover-page heuristic: mostly uppercase, little punctuation
+    upper_ratio = sum(1 for c in stripped if c.isupper()) / max(1, len(stripped))
+    punct_count = sum(stripped.count(p) for p in '.!?;:')
+    if upper_ratio > 0.35 and punct_count < 5:
+        return True
+
+    return False
+
+
+def label_chunks(chunks: list, drop_low_info: bool = True) -> list:
     """
     Attach a numeric ID, a label, and a detected heading to each chunk.
-    Returns list of dicts: {id, label, heading, text}
+    If `drop_low_info` is True (default) cover pages and TOC-like
+    chunks are filtered out before numbering, so "Section 1" is never
+    the report cover.
+    Returns list of dicts: {id, label, display, heading, text}
     """
     labeled = []
-    for i, text in enumerate(chunks):
+    idx = 0
+    for text in chunks:
+        if drop_low_info and _is_low_info(text):
+            continue
+        idx += 1
         heading = detect_heading(text)
-        label = f"Section {i + 1}"
-        if heading:
-            display = f"Section {i + 1}: {heading[:40]}"
-        else:
-            display = label
+        label = f"Section {idx}"
+        display = f"Section {idx}: {heading[:40]}" if heading else label
 
         labeled.append({
-            "id": i + 1,
+            "id": idx,
             "label": label,
             "display": display,
-            "heading": heading or f"Section {i + 1}",
-            "text": text
+            "heading": heading or f"Section {idx}",
+            "text": text,
         })
     return labeled

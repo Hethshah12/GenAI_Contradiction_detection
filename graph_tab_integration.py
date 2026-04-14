@@ -28,7 +28,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
-from pipeline.neo4j_graph import get_graph, NEO4J_AVAILABLE
+
+# Backwards-compat: pipeline.neo4j_graph was merged into pipeline.graph_store.
+# Import from the consolidated module but keep the old path working.
+try:
+    from pipeline.graph_store import get_graph, NEO4J_AVAILABLE
+except ImportError:
+    from pipeline.neo4j_graph import get_graph, NEO4J_AVAILABLE  # type: ignore
 
 
 def render_graph_tab():
@@ -75,6 +81,17 @@ def render_graph_tab():
     c1.metric("Sections in graph", summary["sections"])
     c2.metric("Contradiction edges", summary["edges"])
     c3.metric("Avg confidence", f"{summary['avg_confidence']}%")
+
+    st.divider()
+
+    # ── Interactive contradiction network ─────────────────────────────────────
+    st.markdown("#### Interactive contradiction network")
+    st.caption(
+        "Each node is a section; each edge is a detected contradiction. "
+        "Node size = number of conflicts the section is involved in · "
+        "edge color = severity · hover a node or edge for details."
+    )
+    _render_interactive_graph(graph, doc_name)
 
     st.divider()
 
@@ -172,6 +189,203 @@ def render_graph_tab():
             st.info(f"{selected} has no transitive contradictions.")
 
     graph.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERACTIVE NETWORK VIZ (Plotly + NetworkX spring layout)
+# ─────────────────────────────────────────────────────────────────────────────
+# Renders the section-level contradiction graph as an interactive Plotly
+# figure. Lazy imports keep the main pipeline unaffected if plotly or
+# networkx are missing — the tab degrades to a textual fallback.
+
+_SEVERITY_COLOR = {
+    "High":   "#d73030",
+    "Medium": "#f08819",
+    "Low":    "#b59710",
+}
+
+
+def _render_interactive_graph(graph, doc_name: str) -> None:
+    """Draw the Neo4j-derived contradiction graph as an interactive plot."""
+    # Lazy imports so the tab still loads if plotly/networkx aren't installed.
+    try:
+        import plotly.graph_objects as go
+        import networkx as nx
+    except ImportError:
+        st.info(
+            "Interactive graph requires `plotly` and `networkx`. "
+            "Install with: `pip install plotly networkx`."
+        )
+        return
+
+    try:
+        data = graph.get_graph_nodes_and_edges(doc_name)
+    except Exception as e:
+        st.warning(f"Could not load graph data: {e}")
+        return
+
+    nodes = data.get("nodes") or []
+    edges = data.get("edges") or []
+
+    if not nodes:
+        st.info("No sections found in the graph for this document.")
+        return
+    if not edges:
+        st.success(
+            "No contradiction edges — this document appears internally "
+            "consistent at the section level."
+        )
+        return
+
+    # Build NetworkX graph for layout. We treat edges as undirected for
+    # layout purposes (contradictions are symmetric logically).
+    G = nx.Graph()
+    node_by_id = {n["id"]: n for n in nodes}
+    for n in nodes:
+        G.add_node(n["id"])
+    for e in edges:
+        G.add_edge(e["source"], e["target"], **e)
+
+    # Only render connected nodes + first-degree neighbours. Completely
+    # isolated sections would just float in the corners and distract.
+    connected_ids = set()
+    for e in edges:
+        connected_ids.add(e["source"])
+        connected_ids.add(e["target"])
+    if not connected_ids:
+        st.info("Graph has nodes but no edges to display.")
+        return
+
+    G_sub = G.subgraph(connected_ids).copy()
+
+    # Seed the layout deterministically so the picture is stable on reruns.
+    try:
+        pos = nx.spring_layout(G_sub, k=1.0 / max(1, len(G_sub) ** 0.5),
+                               iterations=60, seed=42)
+    except Exception:
+        pos = nx.kamada_kawai_layout(G_sub)
+
+    # Edge traces — one per severity level so the legend reads cleanly.
+    severity_traces: dict[str, dict] = {
+        "High":   {"x": [], "y": [], "text": []},
+        "Medium": {"x": [], "y": [], "text": []},
+        "Low":    {"x": [], "y": [], "text": []},
+    }
+    for e in edges:
+        if e["source"] not in pos or e["target"] not in pos:
+            continue
+        sev = e.get("severity") or "Low"
+        bucket = severity_traces.setdefault(
+            sev, {"x": [], "y": [], "text": []}
+        )
+        x0, y0 = pos[e["source"]]
+        x1, y1 = pos[e["target"]]
+        bucket["x"] += [x0, x1, None]
+        bucket["y"] += [y0, y1, None]
+        bucket["text"].append(
+            f"{e['source']} ↔ {e['target']}<br>"
+            f"Severity: {sev}<br>Confidence: {e.get('confidence', 0)}%<br>"
+            f"Type: {e.get('type', 'Direct')}"
+        )
+
+    fig = go.Figure()
+
+    # Edges
+    for sev, bucket in severity_traces.items():
+        if not bucket["x"]:
+            continue
+        fig.add_trace(go.Scatter(
+            x=bucket["x"], y=bucket["y"],
+            mode="lines",
+            line=dict(
+                color=_SEVERITY_COLOR.get(sev, "#888"),
+                width=3 if sev == "High" else 2 if sev == "Medium" else 1.2,
+            ),
+            hoverinfo="skip",
+            name=f"{sev} severity ({len(bucket['text'])})",
+            showlegend=True,
+            opacity=0.75,
+        ))
+
+    # Nodes — size scaled by degree, colored by top-edge severity
+    node_x, node_y, node_text, node_labels = [], [], [], []
+    node_sizes, node_colors = [], []
+    for nid in G_sub.nodes():
+        if nid not in pos:
+            continue
+        x, y = pos[nid]
+        node_x.append(x)
+        node_y.append(y)
+        meta = node_by_id.get(nid, {})
+        degree = G_sub.degree(nid)
+        # Highest severity adjacent edge colours the node
+        best_sev = "Low"
+        for _, _, data_ in G_sub.edges(nid, data=True):
+            sev = data_.get("severity", "Low")
+            if sev == "High" or (sev == "Medium" and best_sev == "Low"):
+                best_sev = sev
+                if sev == "High":
+                    break
+        node_colors.append(_SEVERITY_COLOR.get(best_sev, "#888"))
+        node_sizes.append(14 + degree * 6)
+        node_labels.append(nid)
+        preview = (meta.get("preview") or "")[:140].replace("\n", " ")
+        heading = meta.get("heading") or ""
+        node_text.append(
+            f"<b>{nid}</b><br>"
+            f"{heading}<br><br>"
+            f"Conflicts: {degree}<br>"
+            f"{preview}…"
+        )
+
+    fig.add_trace(go.Scatter(
+        x=node_x, y=node_y,
+        mode="markers+text",
+        marker=dict(
+            size=node_sizes,
+            color=node_colors,
+            line=dict(color="#1a1a2a", width=1.5),
+            opacity=0.95,
+        ),
+        text=node_labels,
+        textposition="top center",
+        textfont=dict(size=10, color="#e6edf3"),
+        hoverinfo="text",
+        hovertext=node_text,
+        name="Sections",
+        showlegend=False,
+    ))
+
+    fig.update_layout(
+        height=560,
+        margin=dict(l=10, r=10, t=30, b=10),
+        hovermode="closest",
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=1.02,
+            xanchor="right", x=1,
+            bgcolor="rgba(0,0,0,0)",
+        ),
+        plot_bgcolor="rgba(17, 23, 37, 0.4)",
+        paper_bgcolor="rgba(0, 0, 0, 0)",
+        font=dict(color="#e6edf3"),
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Quick stats under the graph
+    sev_counts = data.get("severity_counts") or {}
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Nodes", len(G_sub.nodes()))
+    s2.metric("Edges", len(edges))
+    s3.metric("High-sev edges", sev_counts.get("High", 0))
+    s4.metric(
+        "Most connected",
+        max(G_sub.degree, key=lambda x: x[1])[0] if G_sub.edges else "—"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

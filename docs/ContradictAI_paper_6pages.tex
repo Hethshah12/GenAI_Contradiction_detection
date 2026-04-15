@@ -1,0 +1,225 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{float}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+\title{ContradictAI: A Multimodal Hybrid Retrieval-Augmented Framework for Detecting Logical Inconsistencies in Long-Form PDF Documents}
+\author{
+\IEEEauthorblockN{Author Name}
+\IEEEauthorblockA{\textit{Department of Computer Science} \\
+\textit{Institution Name}\\
+City, Country \\
+email@institution.edu}
+}
+\maketitle
+% =========================================================================
+\begin{abstract}
+Finding logical inconsistencies inside long-form enterprise documents --- corporate policies, regulatory filings, investor reports, multi-party contracts --- is a slow, manual job that off-the-shelf language tools handle poorly. Sentence-level natural language inference (NLI) classifiers work on short adjacent pairs but miss anything separated by many pages. Retrieval-augmented generation (RAG) pipelines scale further but still stumble on three realistic problems at once: contradictions spread across distant sections, multi-hop chains that only surface after transitive reasoning, and mismatches between charts and the prose describing them. We present \emph{ContradictAI}, a multimodal pipeline that takes a PDF as input and reports contradictions in both text and embedded visual content. The system combines a hybrid retriever (BM25 plus dense FAISS), a local DeBERTa-v3 cross-encoder NLI filter with a calibrated compound score, a LLaMA 3.3-70B reasoning layer served through Groq, a vision-capable LLaMA for chart-to-JSON extraction, a versioned ChromaDB chunk cache, and an optional Neo4j property graph for transitive and cyclic analysis. To our knowledge, ContradictAI is the first end-to-end pipeline that combines within-document visual-textual consistency checking with graph-native multi-hop reasoning in one deployable application. This paper focuses on system design and engineering rationale; a formal empirical evaluation is planned future work and outlined in Section~\ref{sec:eval}.
+\end{abstract}
+\begin{IEEEkeywords}
+contradiction detection, natural language inference, retrieval-augmented generation, multimodal document analysis, knowledge graphs, vision-language models, DeBERTa, BM25, FAISS
+\end{IEEEkeywords}
+
+% =========================================================================
+\section{Introduction}
+Enterprise documents are rarely written in one sitting by one author. Policies, risk disclosures, sustainability reports, and compliance filings are drafted by rotating teams over many quarters, with content merged, duplicated, and revised long past the point where any one editor holds the whole in mind. Once a document passes thirty or fifty thousand words and starts accumulating embedded figures and tables, the likelihood of internal logical drift rises sharply. A paragraph in Section~4 may require multi-factor authentication for every remote connection while a clause in Section~18 quietly flags it as optional. A bar plot on page~12 may show third-quarter revenue of \$4.2M while the paragraph above it rounds the same number to ``over \$5M.'' Each inconsistency is small on its own, but together they distort decisions, create regulatory exposure, and break downstream automation.
+
+Manual review does not scale. A na\"{i}ve ``find contradictions in this document'' prompt to a large language model (LLM) also fails, for three reasons. First, context-window limits force truncation of long inputs, which removes precisely the cross-section evidence the task needs. Second, free-form LLMs tend to hallucinate plausible-sounding contradictions on boilerplate-heavy text. Third, no generic prompt teaches a model to reconcile numbers inside a chart with the prose that describes it. Classical NLI tools such as SummaC~\cite{b1} handle sentence-level entailment well but do not scale to multi-page documents with non-adjacent contradictions and say nothing about visual content.
+
+This paper presents \emph{ContradictAI}, an eleven-stage multimodal pipeline built to close these gaps. The main contributions are:
+\begin{enumerate}
+    \item A \emph{calibrated compound NLI score} combining the contradiction and neutrality outputs of a DeBERTa-v3 cross-encoder, which suppresses the false-positive pattern produced when unrelated passages share surface lexical features.
+    \item A \emph{six-class visual-textual contradiction taxonomy} with its prompt template and retrieval integration, letting one pipeline reason about numerical, directional, categorical, temporal, scope, and omission-type mismatches between embedded charts and surrounding prose.
+    \item A \emph{Neo4j-backed contradiction graph} with Cypher queries that expose transitive chains, circular conflicts, entity-focused clusters, and a hop-decaying propagation score for ranking indirect risk.
+    \item An \emph{LLM-driven auto-calibration module} that samples the first few kilobytes of a document and adjusts chunk granularity, retrieval top-$k$, hybrid-score weight $\alpha$, and confidence thresholds before the main run.
+\end{enumerate}
+
+Section~\ref{sec:related} places ContradictAI in context. Section~\ref{sec:arch} gives the architecture and technology stack. Section~\ref{sec:pipeline} walks through each stage. Section~\ref{sec:eval} describes the planned evaluation. Section~\ref{sec:discussion} discusses trade-offs, and Section~\ref{sec:conclusion} concludes.
+
+% =========================================================================
+\section{Related Work}\label{sec:related}
+\textbf{Sentence-level NLI.} Transformer NLI classifiers trained on MultiNLI~\cite{b4} reliably label sentence pairs as entailed, neutral, or contradictory. BERT~\cite{b2} set the template for masked pre-training; DeBERTa~\cite{b3} refined it with disentangled attention and relative position encoding. SummaC~\cite{b1} repurposes cross-encoder NLI for inconsistency detection in summarisation, showing that aggregating pair-level signals beats zero-shot faithfulness prompts. The limitation for our setting is that these detectors assume the two halves of the pair are already in hand; when the contradictory clause is sixty pages away, retrieval must precede inference.
+
+\textbf{Retrieval-augmented generation.} RAG~\cite{b5} combines parametric language models with non-parametric memory. Dense retrievers over FAISS~\cite{b6} capture paraphrase similarity, while sparse retrievers built on BM25~\cite{b7} remain unbeaten at anchoring on precise tokens like ``Section~4.2'' or ``17\%.'' Production stacks often blend the two through a weighted score --- a pattern we adopt, but apply at the candidate-pair generation layer so that both semantically related and lexically co-occurring clauses reach the NLI filter.
+
+\textbf{Chart grounding.} ChartCheck~\cite{b8} verifies chart claims against external corpora; ChartQAPro~\cite{b9} introduces a harder chart-QA benchmark; M3D~\cite{b10} studies cross-modal alignment in multi-document scientific settings. None of these target the pragmatic question we address: does the chart inside a document agree with the narrative accompanying it on the same or neighbouring page? Both sides come from the same authors, so the failure mode is accidental inconsistency, not misrepresentation, and resolution requires aligning structured chart values with unstructured prose quantifiers.
+
+\textbf{Knowledge-graph reasoning.} KGQA~\cite{b11} shows the value of materialising entities and relations into a graph so multi-hop queries become natural; embedding methods such as TransE~\cite{b12} enable approximate reasoning over such structures. Rather than embed entities and score hypothetical edges, ContradictAI treats each verified contradiction itself as an explicit relation between statement nodes, and uses Cypher to expose chains, cycles, and entity clusters. Cypher is expressive enough for the traversals we need, and the resulting graph stays lightweight.
+
+% =========================================================================
+\section{System Architecture}\label{sec:arch}
+ContradictAI is an eleven-stage pipeline grouped into four layers: (i) ingestion and caching (Stages 0--3), (ii) retrieval and pre-filtering (Stages 4--5), (iii) detection and enrichment (Stages 6--9), and (iv) synthesis, reasoning, and presentation (Stages 10--11). Figure~\ref{fig:pipeline} shows the high-level flow; Figure~\ref{fig:arch} gives the component-level view with optional branches for chart analysis, the knowledge graph, and the question-answering sub-pipeline.
+
+\begin{figure*}[htbp]
+\centerline{\includegraphics[width=\textwidth]{pipeline_flowchart.png}}
+\caption{Stage-to-stage flow of ContradictAI, from PDF ingestion to the Streamlit dashboard. Dashed boxes mark optional branches.}
+\label{fig:pipeline}
+\end{figure*}
+
+\begin{figure*}[htbp]
+\centerline{\includegraphics[width=\textwidth]{architecture_detailed.png}}
+\caption{Component-level architecture. Main text path is centred; chart branch is on the right; Q\&A sub-pipeline is upper-right; Neo4j knowledge graph is at the bottom; Streamlit presentation layer runs along the top.}
+\label{fig:arch}
+\end{figure*}
+
+The reasoning LLM is served by Groq's LPU backend, which delivers LLaMA-3.3-70B at high throughput; combined with a 2-second inter-request delay for free-tier safety, it yields near-interactive latencies. Embeddings and NLI run locally on CPU through \texttt{sentence-transformers}, so the only outbound dependency during detection is the Groq API. Table~\ref{tab:stack} lists the principal components.
+
+\begin{table}[htbp]
+\caption{Principal Technology and Model Choices}
+\label{tab:stack}
+\begin{center}
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Component} & \textbf{Library / Model} & \textbf{Role} \\
+\hline
+Web interface & Streamlit $\geq$ 1.32 & Dashboard, cards, tabs \\
+Embeddings & all-MiniLM-L6-v2 & 384-dim dense vectors \\
+Dense index & FAISS-CPU $\geq$ 1.8 & ANN retrieval (flat L2) \\
+Sparse index & rank-bm25 $\geq$ 0.2.2 & BM25 lexical ranking \\
+NLI filter & DeBERTa-v3 cross-encoder & Pair-level scoring \\
+Reasoning LLM & LLaMA-3.3-70B (Groq) & Enrichment, classification \\
+Vision LLM & LLaMA-4-Scout-17B (Groq) & Chart-to-JSON extraction \\
+PDF parser & PyMuPDF (fitz) $\geq$ 1.24 & Text + raster rendering \\
+Cache & ChromaDB $\geq$ 0.5 & Chunk persistence \\
+Graph DB & Neo4j $\geq$ 5.18 & Cypher multi-hop queries \\
+PDF export & fpdf2 $\geq$ 2.7 & Branded report \\
+Charts & Plotly $\geq$ 5.20 + NetworkX & Interactive visuals \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+Internal modules communicate through three flat JSON-serialisable records: a \emph{text chunk} (id, label, heading, text); a \emph{chart chunk} (a superset with id $\geq$ 10001, chart type, page number, and structured data); and a \emph{contradiction record} (target and related section labels, severity, confidence, taxonomy type, and, for visual findings, the chart claim, the text claim, a multi-hop flag, and a page number). This schema keeps the UI, PDF exporter, and graph builder decoupled from detection.
+
+% =========================================================================
+\section{Pipeline Stages}\label{sec:pipeline}
+\subsection{Stages 0--3: Ingest, Calibrate, Chunk}
+On upload, the filename is MD5-hashed and used to look up a ChromaDB collection keyed by the hash and a module-level \texttt{CHUNK\_VERSION}. A hit reuses stored chunks and rebuilds only the in-memory FAISS index; a miss proceeds through extraction, calibration, and chunking. Bumping \texttt{CHUNK\_VERSION} transparently evicts stale collections on next load.
+
+PyMuPDF walks the PDF page by page, emitting text in layout order and rasterising each page at 200~DPI to capture vector charts that are invisible to a pixel-oriented vision model. Inline raster images are cleaned by four filters: an occurrence counter drops anything appearing three or more times (logos, headers), a size filter rejects anything below 150~px on either side, an aspect-ratio filter rejects anything more elongated than 8:1, and an MD5 deduplicator removes repeats after CMYK-to-RGB normalisation.
+
+In automatic mode, the first $\sim$2{,}000 characters are sent to LLaMA-3.3-70B behind a strict JSON-schema prompt. The model returns suggested chunk-size bounds, top-$k$, hybrid weight $\alpha$, and a minimum confidence, each clamped to a safe range before use; the API-delay is hard-pinned to 2.0~s regardless of what the model suggests. Dense legal text invites smaller chunks and stricter thresholds; narrative reports tolerate the opposite. A conservative default profile kicks in when the JSON parse fails.
+
+Chunking tries heading-based splitting first, on a regex matching ``$d$[.$d$]+~Title'' patterns, so each administrative section becomes its own chunk --- important because many inconsistencies live inside a single section. When no headings are found, a paragraph splitter accumulates double-newline blocks within size bounds and uses a 200-character rolling overlap so the NLI classifier never sees a hard cut mid-sentence.
+
+\subsection{Stage 4: Hybrid Retrieval}
+Chunks are embedded with all-MiniLM-L6-v2 into 384-dim vectors and indexed in a FAISS \texttt{IndexFlatL2}. We use exact flat search because documents here contain a few hundred to a few thousand chunks, a range where flat is fast, exact, and needs no training step. In parallel, chunks are tokenised (lowercase, $\sim$60 stopwords removed) and fed to a rank-bm25 \texttt{BM25Okapi} index. The \texttt{HybridRetriever} combines the two:
+\begin{equation}
+\text{score}(q, c) = \alpha \cdot s_{\text{dense}}(q, c) + (1-\alpha) \cdot s_{\text{BM25}}(q, c),
+\label{eq:hybrid}
+\end{equation}
+with both sides rescaled to $[0,1]$ to remove distance-scale bias. BM25 anchors on precise tokens --- ``Section~4.2,'' ``17\%,'' ``Q3~2023'' --- that a dense retriever tends to average away.
+
+\subsection{Stage 5: Calibrated NLI Pre-filter}
+This is the primary computational novelty. Instead of sending every candidate pair to a distant LLM --- which scales linearly in cost and super-linearly in latency --- we pre-filter locally with a DeBERTa-v3 cross-encoder. For each pair the model emits three logits for contradiction, entailment, and neutrality; a softmax gives $P_c$, $P_e$, $P_n$. Thresholding on $P_c$ alone fails in a known way: the contradiction head also fires on \emph{unrelated} pairs that share stock phrases or boilerplate. In those cases $P_n$ is also elevated, so we use the compound score
+\begin{equation}
+s = P_c \cdot (1 - P_n),
+\label{eq:score}
+\end{equation}
+which rewards high contradiction and penalises high neutrality. We accept pairs when $s \geq 0.40$ intra-section (where narrative context constrains interpretation) and $s \geq 0.55$ cross-section (which is noisier).
+
+Three lightweight gates precede the classifier call. A \emph{topical overlap} gate requires a minimum shared-keyword count (one intra, two cross) and discards off-topic pairs. A \emph{meta-sentence} blocklist drops sentences that describe the document itself (``the following section contains\ldots,'' ``statement A conflicts with B''), which otherwise inflate scores on self-referential test documents. A \emph{pairwise deduplicator} keyed on a sorted normalised chunk-ID tuple stops the same semantic pair being rescored under different orderings. Survivors are batched in groups of 64 and passed to the cross-encoder.
+
+\subsection{Stages 6--7: Type Classification and LLM Enrichment}
+Surviving candidates get a rule-based type label over seven classes: \emph{Numerical} (digits with small edit distance but different values), \emph{Temporal} (conflicting dates), \emph{Scope} (opposing universal quantifiers such as ``all'' vs.\ ``no''), \emph{Direct} (antonym pairs like ``must'' vs.\ ``must not''), \emph{Conditional} (``if,'' ``when''), \emph{Exception} (``unless,'' ``except''), and \emph{Definitional}. The label is not authoritative; it feeds the downstream prompt as a structural hint.
+
+Only the three highest-scoring pairs are enriched with an LLM explanation, keeping cost bounded. The prompt includes both chunk bodies, the type label, and the NLI score, and asks LLaMA-3.3-70B to return a tightly structured block: \texttt{CONTRADICTION FOUND} followed by Source, Type, Severity, Confidence, and Explanation. Severity is derived deterministically from confidence (High $>$80, Medium 60--79, Low otherwise). An optional self-consistency mode runs the same prompt at temperatures 0.0, 0.3, and 0.5 and accepts only pairs where at least two of three agree, recording the agreement as a stability score. Because of the added latency, self-consistency is opt-in.
+
+\subsection{Stage 8: Chart Analysis (Optional)}
+When the chart toggle is on, each rasterised page is sent to a Groq vision model. The backend is resolved at first use by probing, in order, \texttt{llama-4-scout-17b-16e-instruct}, \texttt{llama-3.2-90b-vision-preview}, and \texttt{llama-3.2-11b-vision-preview}, caching the first that responds. A two-phase protocol follows: Phase~1 asks a cheap ``are charts present?'' question capped at 30 tokens, and skips text-only pages; Phase~2 extracts chart type, title, axes, labelled data points, trends, and key findings under a strict JSON schema, with a simpler fallback prompt on parse failure. Phase~2 results are deduplicated against inline-image extractions by a 70\% label-overlap check.
+
+Each retained chart is converted to a rich natural-language paragraph via \texttt{ChartData.to\_text\_chunk()}, assigned a chunk ID $\geq$~10001, and embedded alongside text chunks through the \emph{same} MiniLM-FAISS-BM25 pipeline. The hybrid retriever therefore transparently returns mixed text and chart evidence for a query like ``Q3 revenue,'' which simplifies the downstream reasoning layer considerably.
+
+\subsection{Stage 9: Visual-Textual Contradiction Detection}
+For each chart chunk, the hybrid retriever returns the top-$k$ related text chunks. LLaMA-3.3-70B is then prompted with the structured chart summary and the retrieved prose and asked to classify any mismatch into one of six categories: \emph{Numerical} (quantitative disagreement), \emph{Trend} (directional), \emph{Scope} (coverage), \emph{Categorical} (label sets), \emph{Temporal} (time-period), and \emph{Omission} (one side references something absent from the other). An optional \emph{multi-hop} extension fetches a secondary text chunk and checks whether the chart, the primary text, and the secondary text are jointly consistent --- a three-way analysis that surfaces contradictions none of the pairwise checks would. A tolerance rule requires at least a 10\% relative difference before a numerical discrepancy is reported, to absorb vision-model noise on axis labels.
+
+\subsection{Stage 10: Knowledge Graph (Optional)}
+If Neo4j is reachable, the contradiction set is materialised as a property graph with four node types --- \texttt{Document}, \texttt{Section}, \texttt{Statement}, \texttt{Entity} --- and five relationships: \texttt{HAS\_SECTION}, \texttt{CONTAINS}, \texttt{MENTIONS}, \texttt{CONTRADICTS} (carrying score, type, severity, confidence), and an aggregated \texttt{CONTRADICTS\_SECTION} edge with count, max score, and type list. Entity extraction uses 26 hand-crafted regular expressions covering security (MFA, VPN, encryption), work policy (remote work, core hours, leave), data governance (sensitive information, cloud storage, BYOD), and communication channels. All entities are introduced via \texttt{MERGE}, so the build is idempotent under repeated runs.
+
+Four Cypher queries feed the Knowledge Graph tab. A \emph{transitive-chain} query returns $A \rightarrow B \rightarrow C$ paths where $A$ and $C$ are not directly connected. An \emph{entity-cluster} query groups contradictions by mentioned entities (``show me everything that touches VPN policy''). A \emph{section-centrality} query ranks sections by \texttt{CONTRADICTS\_SECTION} in-degree. An extended module adds a \emph{circular-contradiction} query for cycles $A \leftrightarrow B \leftrightarrow \ldots \leftrightarrow A$ --- which have no consistent resolution --- together with a hop-decaying propagation-score metric for ranking indirect risk.
+
+\subsection{Stage 11: Visualisation, Reporting, and Q\&A}
+The dashboard renders nine interactive Plotly/NetworkX views: severity-coloured bar chart, type donut, confidence histogram, section-pair heatmap, force-directed contradiction network, per-section risk bar, visual-contradiction summary, chart-vs-text cross-modal network, and a consistency report for clean documents. An fpdf2 writer exports a branded PDF with severity-coded header bars, truncated previews, and Latin-1 sanitisation.
+
+An independent Q\&A sub-pipeline reuses the hybrid retriever. Queries are answered by LLaMA-3.3-70B at temperature zero with a prompt that enforces explicit citation (``According to Section~N\ldots'') and requires the model to say when retrieved evidence is insufficient. The deterministic, citation-heavy configuration is designed to reduce hallucination versus an open-ended Q\&A prompt.
+
+% =========================================================================
+\section{Planned Evaluation}\label{sec:eval}
+This is a system-design paper. A formal evaluation of detection quality, runtime, and ablations is planned; we describe the methodology here so it can be reproduced directly.
+
+\textbf{Benchmark.} We plan a 25--30-section document with hand-seeded contradictions covering all seven text-level types and at least four of the six visual-textual types --- numerical mismatches between distant sections, scope inversions between universal and cohort-restricted clauses, temporal mismatches between summary and roadmap, and chart-versus-prose disagreements. Two annotators should review each label and report inter-annotator agreement (Cohen's $\kappa$).
+
+\textbf{Baselines.} Three comparisons are planned: a \emph{Direct LLM} configuration that submits every candidate pair to LLaMA-3.3-70B without NLI filtering; a \emph{Pure NLI} configuration using DeBERTa-v3 contradiction probability alone; and SummaC-ZS~\cite{b1} as a prior-art NLI baseline. Precision, recall, and F1 should be reported for each.
+
+\textbf{Ablations.} Four components warrant isolation: the compound NLI score (versus $P_c$ alone), the BM25 component (versus dense-only retrieval), the topical-overlap gate, and the auto-calibrator. Each is disabled or replaced with a na\"{i}ve alternative and $\Delta$F1 is reported.
+
+\textbf{Multi-hop and runtime.} The benchmark should include seeded transitive chains and at least one cycle, and report the fraction recovered. End-to-end wall-clock time should be measured for cold and warm runs on a representative consumer laptop, with the chart branch measured separately.
+
+% =========================================================================
+\section{Discussion}\label{sec:discussion}
+\subsection{The Compound Score}
+Equation~\ref{eq:score} was motivated by a recurring failure mode: two unrelated paragraphs, each carrying a common disclaimer phrase, sometimes have both $P_c$ and $P_n$ elevated. $P_c$ alone looks suspicious in these cases; the compound score collapses them toward zero. The formula is deliberately simple. A natural next step is to replace it with a small learned reranker trained on manually labelled pairs.
+
+\subsection{Omission-Type Mismatches}
+Omission is qualitatively harder than the other five visual-textual classes because it demands asserting an \emph{absence} rather than quantifying a disagreement. Current chat-style vision-language models flag absences unreliably, especially for ancillary data. Specialised chart-grounding models or a structured chart-to-table converter would likely close much of this gap.
+
+\subsection{Neo4j Dependency}
+Multi-hop traversal currently needs a live Neo4j instance. A NetworkX-based in-memory fallback would enable transitive-chain and circular-contradiction detection in environments without an external database, at the cost of Cypher expressiveness and server-side persistence.
+
+\subsection{Scalability}
+The NLI pre-filter is $O(k^2)$ in the retrieval top-$k$. For very long documents, CPU-bound DeBERTa inference dominates; batching at 64 recovers much of the gap and GPU acceleration cuts it by roughly an order of magnitude. Restricting cross-section comparisons to pairs whose hybrid score exceeds a document-dependent percentile would further reduce work.
+
+\subsection{Role of Auto-Calibration}
+The calibrator is primarily a robustness mechanism for documents far from a generic policy style --- dense contract language or earnings narratives. For mid-range corporate documents we expect the default profile to be close in accuracy; quantifying the gap is part of the planned evaluation. An offline profile selector based on a simple document-type classifier could suffice in cost-sensitive deployments.
+
+% =========================================================================
+\section{Conclusion}\label{sec:conclusion}
+We presented ContradictAI, a multimodal hybrid-RAG pipeline for detecting logical inconsistencies in long-form PDFs. The system combines a calibrated DeBERTa-v3 NLI pre-filter with a compound contradiction-neutrality score, a hybrid BM25+FAISS retriever, a top-$k$ LLaMA-3.3-70B enrichment layer, a six-class visual-textual detector, and an optional Neo4j reasoning layer, all behind a single Streamlit dashboard. To our knowledge it is the first end-to-end system that addresses within-document visual-textual contradiction alongside text-level and graph-native multi-hop reasoning.
+
+Four directions are immediate. First, execute the evaluation programme in Section~\ref{sec:eval}, including precision/recall/F1 against SummaC-ZS and LLM-only baselines, ablations, and runtime characterisation. Second, replace the hand-tuned compound score with a learned reranker and compare with contrastive retrievers fine-tuned on contradiction data. Third, extend the visual taxonomy beyond charts to tables and equations. Fourth, provide a NetworkX fallback for multi-hop traversal so the graph layer runs without Neo4j, and benchmark on public datasets such as ContractNLI~\cite{b13}.
+
+% =========================================================================
+\section*{Acknowledgment}
+The authors thank the maintainers of Groq, sentence-transformers, FAISS, BM25, ChromaDB, PyMuPDF, fpdf2, and Neo4j, whose open tooling made this integration tractable.
+
+% =========================================================================
+\begin{thebibliography}{00}
+\bibitem{b1}
+P. Laban, T. Schnabel, P. N. Bennett, and M. A. Hearst, ``SummaC: Re-visiting NLI-based models for inconsistency detection in summarization,'' \textit{Trans. Assoc. Comput. Linguistics}, vol. 10, pp. 163--177, 2022.
+\bibitem{b2}
+J. Devlin, M.-W. Chang, K. Lee, and K. Toutanova, ``BERT: Pre-training of deep bidirectional transformers for language understanding,'' in \textit{Proc. NAACL-HLT}, 2019, pp. 4171--4186.
+\bibitem{b3}
+P. He, J. Gao, and W. Chen, ``DeBERTaV3: Improving DeBERTa using ELECTRA-style pre-training with gradient-disentangled embedding sharing,'' in \textit{Proc. ICLR}, 2023.
+\bibitem{b4}
+A. Williams, N. Nangia, and S. Bowman, ``A broad-coverage challenge corpus for sentence understanding through inference,'' in \textit{Proc. NAACL-HLT}, 2018, pp. 1112--1122.
+\bibitem{b5}
+P. Lewis \textit{et al.}, ``Retrieval-augmented generation for knowledge-intensive NLP tasks,'' in \textit{Proc. NeurIPS}, 2020, pp. 9459--9474.
+\bibitem{b6}
+J. Johnson, M. Douze, and H. Jegou, ``Billion-scale similarity search with GPUs,'' \textit{IEEE Trans. Big Data}, vol. 7, no. 3, pp. 535--547, 2021.
+\bibitem{b7}
+S. Robertson and H. Zaragoza, ``The probabilistic relevance framework: BM25 and beyond,'' \textit{Found. Trends Inf. Retr.}, vol. 3, no. 4, pp. 333--389, 2009.
+\bibitem{b8}
+N. Akhtar, S. Gupta, and A. Ekbal, ``ChartCheck: An evidence-based approach to automated fact-checking using charts,'' \textit{arXiv:2311.07453}, 2023.
+\bibitem{b9}
+A. Masry \textit{et al.}, ``ChartQAPro: A more complex benchmark for chart question answering,'' \textit{arXiv:2504.05506}, 2025.
+\bibitem{b10}
+C. Li, Z. Wang, and J. Tang, ``M3D: Multi-modal multi-document understanding,'' in \textit{Proc. EMNLP}, 2024, pp. 3712--3726.
+\bibitem{b11}
+X. Yao and B. Van Durme, ``Information extraction over structured data: Question answering with Freebase,'' in \textit{Proc. ACL}, 2014, pp. 956--966.
+\bibitem{b12}
+A. Bordes, N. Usunier, A. Garcia-Duran, J. Weston, and O. Yakhnenko, ``Translating embeddings for modeling multi-relational data,'' in \textit{Proc. NeurIPS}, 2013, pp. 2787--2795.
+\bibitem{b13}
+Y. Koreeda and C. D. Manning, ``ContractNLI: A dataset for document-level natural language inference for contracts,'' in \textit{Proc. EMNLP Findings}, 2021, pp. 1907--1919.
+\end{thebibliography}
+\end{document}
